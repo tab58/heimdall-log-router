@@ -3,11 +3,10 @@ package app
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
-	"github.com/tbright/log-router/internal/ai"
-	"github.com/tbright/log-router/internal/store"
+	"github.com/tbright/heimdall/internal/ai"
+	"github.com/tbright/heimdall/internal/store"
 )
 
 type Application interface {
@@ -21,12 +20,33 @@ type application struct {
 	debounce debouncer
 }
 
-func NewApplication() Application {
-	return &application{
-		store:    store.New("/tmp/logrouter/data/all.jsonl"),
-		analyzer: ai.NewAnalyzer(os.Getenv("ANTHROPIC_API_KEY")),
-		debounce: debouncer{cooldown: 5 * time.Second},
+type ApplicationConfig struct {
+	Store        *store.LogStore
+	LlmApiKey    string
+	DebounceTime time.Duration
+}
+
+func NewApplication(cfg ApplicationConfig) (Application, error) {
+	store := cfg.Store
+	if store == nil {
+		return nil, fmt.Errorf("store is required")
 	}
+
+	debounceTime := cfg.DebounceTime
+	if debounceTime == 0 {
+		debounceTime = 5 * time.Second
+	}
+
+	llmApiKey := cfg.LlmApiKey
+	if llmApiKey == "" {
+		return nil, fmt.Errorf("llm api key is required")
+	}
+
+	return &application{
+		store:    cfg.Store,
+		analyzer: ai.NewAnalyzer(llmApiKey),
+		debounce: debouncer{cooldown: debounceTime},
+	}, nil
 }
 
 func (a *application) HandleAsk(ctx context.Context, question string, numLogs int) (string, error) {
@@ -67,7 +87,7 @@ func (a *application) analyzeAsync(errorEntry store.LogEntry) {
 	contextLogs := a.store.RecentContext(100)
 	analysis, err := a.analyzer.AnalyzeError(ctx, errorEntry, contextLogs)
 	if err != nil {
-		fmt.Printf("[log-router] AI analysis failed: %v\n", err)
+		fmt.Printf("[heimdall] AI analysis failed: %v\n", err)
 		return
 	}
 

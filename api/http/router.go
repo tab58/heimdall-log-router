@@ -6,13 +6,13 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humagin"
 	"github.com/gin-gonic/gin"
-	"github.com/tbright/log-router/internal/app"
+	"github.com/tbright/heimdall/internal/app"
 )
 
 const (
-	ServiceName = "log-router"
+	ServiceName = "heimdall"
 	Version     = "1.0.0"
-	Description = "The Log Router is a service that routes logs to the appropriate destination."
+	Description = "Heimdall is a service that routes logs to the appropriate destination."
 )
 
 type ServerConfig struct {

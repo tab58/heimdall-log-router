@@ -9,7 +9,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/tbright/log-router/internal/store"
+	"github.com/tbright/heimdall/internal/store"
 )
 
 const (

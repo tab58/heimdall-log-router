@@ -1,4 +1,4 @@
-module github.com/tbright/log-router
+module github.com/tbright/heimdall
 
 go 1.25.0
 

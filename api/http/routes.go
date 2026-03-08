@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/tbright/log-router/internal/app"
+	"github.com/tbright/heimdall/internal/app"
 )
 
 type ingestRequest struct {

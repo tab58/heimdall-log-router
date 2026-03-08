@@ -1,8 +1,8 @@
-# Vector Configuration for Log Router
+# Vector Configuration for Heimdall
 # Install: brew install vectordev/brew/vector
 # Run: vector --config vector.yaml
 
-data_dir: /tmp/logrouter/vector-data
+data_dir: /tmp/heimdall/vector-data
 
 # ==============================================================================
 # SOURCES — where logs come from
@@ -19,7 +19,7 @@ sources:
   api_logs:
     type: file
     include:
-      - /tmp/logrouter/logs/api/*.log
+      - /tmp/heimdall/logs/api/*.log
     read_from: end
     fingerprint:
       strategy: device_and_inode
@@ -27,7 +27,7 @@ sources:
   worker_logs:
     type: file
     include:
-      - /tmp/logrouter/logs/worker/*.log
+      - /tmp/heimdall/logs/worker/*.log
     read_from: end
     fingerprint:
       strategy: device_and_inode
@@ -72,7 +72,7 @@ transforms:
     type: remap
     inputs: [stdin_logs]
     source: |
-      .log_source = get_env_var("LOGROUTER_SOURCE") ?? "stdin"
+      .log_source = get_env_var("HEIMDALL_SOURCE") ?? "stdin"
       .service = .log_source
 
   tag_http:
@@ -127,7 +127,7 @@ sinks:
   all_logs_file:
     type: file
     inputs: [merged]
-    path: /tmp/logrouter/data/all.jsonl
+    path: /tmp/heimdall/data/all.jsonl
     encoding:
       codec: json
 

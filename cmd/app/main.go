@@ -10,8 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tbright/log-router/api/http"
-	"github.com/tbright/log-router/internal/app"
+	"github.com/tbright/heimdall/api/http"
+	"github.com/tbright/heimdall/internal/app"
+	"github.com/tbright/heimdall/internal/store"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -21,12 +22,22 @@ func main() {
 		log.Fatal("ANTHROPIC_API_KEY not configured")
 	}
 
+	// create application
+	app, err := app.NewApplication(app.ApplicationConfig{
+		Store:        store.New("/tmp/heimdall/data/all.jsonl"),
+		LlmApiKey:    apiKey,
+		DebounceTime: 5 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("failed to create application: %v", err)
+	}
+
 	srv := http.NewServer(http.ServerConfig{
-		Address:     ":8080",
-		Application: app.NewApplication(),
+		Address:     ":7077",
+		Application: app,
 	})
 
-	// start server
+	// start HTTP server
 	errgroup, _ := errgroup.WithContext(context.Background())
 	errgroup.Go(func() error {
 		fmt.Printf("starting server on port %s\n", srv.Addr)

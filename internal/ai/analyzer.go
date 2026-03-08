@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"strings"
 	"time"
@@ -14,20 +15,11 @@ import (
 const (
 	AnthropicModel = "claude-sonnet-4-5-20250514"
 	MaxTokens      = 1024
+	Analyis
 )
 
-const systemPrompt = `You are a local development log analyzer. You receive error logs and surrounding context from multiple services running on a developer's machine.
-
-Your job:
-1. Identify the root cause of the error
-2. Check if logs from other services show correlated failures
-3. Provide a concise diagnosis and actionable fix
-
-Format your response as:
-**Root Cause**: One-line summary
-**Correlated Issues**: Any related errors from other services (or "None")
-**Fix**: Step-by-step resolution
-**Code**: If applicable, show the fix`
+//go:embed system_prompt.go.tmpl
+var systemPrompt string
 
 type Analyzer struct {
 	client anthropic.Client

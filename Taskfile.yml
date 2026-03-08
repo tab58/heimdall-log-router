@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3"
+
+vars:
+  GREETING: Hello, world!
+
+tasks:
+  run:
+    desc: Run the system
+    deps:
+      - run-agent
+      - run-vector
+    silent: true
+
+  run-agent:
+    desc: Run the agent
+    cmds:
+      - go run cmd/agent/main.go
+    silent: true
+
+  run-vector:
+    desc: Run vector
+    cmds:
+      - vector --config vector.yaml
+    silent: true
+
+  run-cli:
+    desc: Run the CLI
+    cmds:
+      - go run cmd/cli/main.go
+    silent: true

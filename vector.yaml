@@ -1,0 +1,153 @@
+# Vector Configuration for Log Router
+# Install: brew install vectordev/brew/vector
+# Run: vector --config vector.yaml
+
+data_dir: /tmp/logrouter/vector-data
+
+# ==============================================================================
+# SOURCES — where logs come from
+# ==============================================================================
+sources:
+  # Stdin pipe: echo "hello" | vector --config vector.yaml
+  # For ad-hoc use; typically you'll use file/docker sources
+  stdin_logs:
+    type: stdin
+    decoding:
+      codec: bytes
+
+  # Tail log files from your services
+  api_logs:
+    type: file
+    include:
+      - /tmp/logrouter/logs/api/*.log
+    read_from: end
+    fingerprint:
+      strategy: device_and_inode
+
+  worker_logs:
+    type: file
+    include:
+      - /tmp/logrouter/logs/worker/*.log
+    read_from: end
+    fingerprint:
+      strategy: device_and_inode
+
+  # HTTP endpoint — services can POST logs directly
+  # curl -X POST http://localhost:8686/logs -d '{"message":"hello","level":"info"}'
+  http_logs:
+    type: http_server
+    address: "0.0.0.0:8686"
+    path: /logs
+    decoding:
+      codec: json
+
+  # Docker container logs (uncomment if using Docker)
+  # docker_logs:
+  #   type: docker_logs
+  #   include_containers:
+  #     - "api-*"
+  #     - "worker-*"
+  #     - "postgres-*"
+
+# ==============================================================================
+# TRANSFORMS — normalize everything into a common shape
+# ==============================================================================
+transforms:
+  # Tag file-based logs with their source name
+  tag_api:
+    type: remap
+    inputs: [api_logs]
+    source: |
+      .log_source = "api"
+      .service = "api"
+
+  tag_worker:
+    type: remap
+    inputs: [worker_logs]
+    source: |
+      .log_source = "worker"
+      .service = "worker"
+
+  tag_stdin:
+    type: remap
+    inputs: [stdin_logs]
+    source: |
+      .log_source = get_env_var("LOGROUTER_SOURCE") ?? "stdin"
+      .service = .log_source
+
+  tag_http:
+    type: remap
+    inputs: [http_logs]
+    source: |
+      if !exists(.log_source) {
+        .log_source = "http"
+      }
+      if !exists(.service) {
+        .service = .log_source
+      }
+
+  # Merge all tagged sources into a single stream
+  merged:
+    type: remap
+    inputs: [tag_api, tag_worker, tag_stdin, tag_http]
+    source: |
+      # Normalize timestamp
+      .timestamp = now()
+
+      # Extract log level from message if not already set
+      if !exists(.level) {
+        .level = "info"
+        if match(string!(.message), r'(?i)\b(error|err)\b') {
+          .level = "error"
+        } else if match(string!(.message), r'(?i)\b(warn|warning)\b') {
+          .level = "warn"
+        } else if match(string!(.message), r'(?i)\b(debug|dbg)\b') {
+          .level = "debug"
+        } else if match(string!(.message), r'(?i)\b(fatal|panic)\b') {
+          .level = "fatal"
+        }
+      }
+
+      # Normalize level to lowercase
+      .level = downcase(string!(.level))
+
+  # Filter stream for errors only — sent to AI agent
+  errors_only:
+    type: filter
+    inputs: [merged]
+    condition:
+      type: vrl
+      source: includes(["error", "fatal"], .level)
+
+# ==============================================================================
+# SINKS — where logs go
+# ==============================================================================
+sinks:
+  # All logs to a single JSONL file (queryable by AI agent)
+  all_logs_file:
+    type: file
+    inputs: [merged]
+    path: /tmp/logrouter/data/all.jsonl
+    encoding:
+      codec: json
+
+  # Console output for development/debugging
+  console_out:
+    type: console
+    inputs: [merged]
+    encoding:
+      codec: json
+
+  # POST errors to your AI agent service for analysis
+  ai_agent:
+    type: http
+    inputs: [errors_only]
+    uri: "http://localhost:7077/ingest"
+    method: post
+    encoding:
+      codec: json
+    batch:
+      max_events: 10
+      timeout_secs: 2
+    request:
+      retry_max_duration_secs: 10

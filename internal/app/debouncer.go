@@ -11,7 +11,7 @@ type debouncer struct {
 	cooldown time.Duration
 }
 
-func (d *debouncer) shouldFire() bool {
+func (d *debouncer) ShouldFire() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

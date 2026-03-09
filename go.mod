@@ -6,7 +6,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.2.0
 	github.com/danielgtaylor/huma/v2 v2.37.2
 	github.com/gin-gonic/gin v1.12.0
-	golang.org/x/sync v0.19.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

@@ -2,66 +2,57 @@ package app
 
 import (
 	"context"
-	"errors"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/tbright/heimdall/internal/ai"
-	"github.com/tbright/heimdall/internal/plugin"
-	"github.com/tbright/heimdall/internal/store"
+	"github.com/tab58/heimdall-log-router/internal/app/agent"
+	"github.com/tab58/heimdall-log-router/internal/app/store"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
 
 const (
 	analysisTimeout    = 30 * time.Second
 	defaultDebounce    = 5 * time.Second
 	recentContextCount = 100
+	eventsChanSize     = 512
 )
 
+// Application is the central abstraction: it consumes streams, routes events
+// through the agent, and writes results to the configured output stream.
 type Application interface {
-	HandleVectorIngest(ctx context.Context, log *VectorIngestLogEntry) error
-	HandleAsk(ctx context.Context, question string, numLogs int) (string, error)
-	// Wait blocks until all in-flight background goroutines (e.g., auto-analysis) complete.
+	AddStream(s stream.ReadStream)
+	Start(ctx context.Context)
 	Wait()
 }
 
-// analyzer is an internal interface for AI analysis, satisfied by ai.Analyzer.
-type analyzer interface {
-	AnalyzeError(ctx context.Context, errorEntry store.LogEntry, contextEntries []store.LogEntry) (string, error)
-	Ask(ctx context.Context, question string, contextEntries []store.LogEntry) (string, error)
+// ApplicationConfig wires the components that make up the application.
+type ApplicationConfig struct {
+	DebounceTime time.Duration
+	Logger       *log.Logger
+	Output       stream.WriteStream
 }
 
 type application struct {
-	store      *store.LogStore
-	analyzer   analyzer
-	debounce   debouncer
-	dispatcher *plugin.Dispatcher
-	logger     *log.Logger
-	wg         sync.WaitGroup
+	agent     agent.Agent
+	store     *store.LogStore
+	debounce  debouncer
+	inflight  inflight
+	events    chan stream.Event
+	logger    *log.Logger
+	closeOnce sync.Once
+	loopDone  chan struct{}
+	streamWg  sync.WaitGroup // tracks stream fan-in goroutines
+	wg        sync.WaitGroup // tracks analysis goroutines
+
+	output stream.WriteStream
 }
 
-type ApplicationConfig struct {
-	Store        *store.LogStore
-	LlmApiKey    string
-	DebounceTime time.Duration
-	Dispatcher   *plugin.Dispatcher
-	Logger       *log.Logger
-}
-
-func NewApplication(cfg ApplicationConfig) (Application, error) {
-	store := cfg.Store
-	if store == nil {
-		return nil, errors.New("store is required")
-	}
-
+// NewApplication constructs an Application from cfg.
+func NewApplication(cfg ApplicationConfig) Application {
 	debounceTime := cfg.DebounceTime
 	if debounceTime == 0 {
 		debounceTime = defaultDebounce
-	}
-
-	llmApiKey := cfg.LlmApiKey
-	if llmApiKey == "" {
-		return nil, errors.New("llm api key is required")
 	}
 
 	logger := cfg.Logger
@@ -69,90 +60,93 @@ func NewApplication(cfg ApplicationConfig) (Application, error) {
 		logger = log.Default()
 	}
 
+	analyzer := agent.NewAnalyzer()
+
 	return &application{
-		store:      cfg.Store,
-		analyzer:   ai.NewAnalyzer(llmApiKey),
-		debounce:   debouncer{cooldown: debounceTime},
-		dispatcher: cfg.Dispatcher,
-		logger:     logger,
-	}, nil
-}
-
-func (a *application) HandleAsk(ctx context.Context, question string, numLogs int) (string, error) {
-	contextLogs := a.store.RecentContext(numLogs)
-	result, err := a.analyzer.Ask(ctx, question, contextLogs)
-	if err != nil {
-		return "", err
+		agent:    analyzer,
+		store:    store.New(),
+		debounce: debouncer{cooldown: debounceTime},
+		events:   make(chan stream.Event, eventsChanSize),
+		logger:   logger,
+		loopDone: make(chan struct{}),
+		output:   cfg.Output,
 	}
-
-	a.dispatchPayload(ctx, plugin.AskResponse, result, contextLogs)
-
-	return result, nil
 }
 
-type VectorIngestLogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Source    string    `json:"log_source"`
-	Level     string    `json:"level"`
-	Message   string    `json:"message"`
-	Service   string    `json:"service"`
+// AddStream registers a stream with the application. A goroutine drains the
+// stream's channel into the central events channel until the stream is closed.
+func (a *application) AddStream(s stream.ReadStream) {
+	a.streamWg.Go(func() {
+		for e := range s.Events() {
+			select {
+			case a.events <- e:
+			case <-a.loopDone:
+				return
+			}
+		}
+	})
 }
 
-func (a *application) HandleVectorIngest(ctx context.Context, log *VectorIngestLogEntry) error {
-	storeEntry := store.LogEntry{
-		Timestamp: log.Timestamp,
-		Source:    log.Source,
-		Level:     log.Level,
-		Message:   log.Message,
-		Service:   log.Service,
+// Start launches the main event loop. It returns immediately; use Wait to block
+// until all in-flight work has completed after streams are closed.
+func (a *application) Start(ctx context.Context) {
+	go func() {
+		defer close(a.loopDone)
+		for {
+			select {
+			case e, ok := <-a.events:
+				if !ok {
+					return
+				}
+				a.store.Append(e)
+				if isActionable(e) && a.debounce.ShouldFire() {
+					a.wg.Go(func() { a.processAsync(e) })
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Wait blocks until all in-flight analysis goroutines complete.
+//
+// Sequence:
+//  1. Wait for all stream goroutines to drain their channels into a.events.
+//  2. Close a.events so the event loop drains any remaining buffered events.
+//  3. Wait for the event loop to exit (guarantees all wg.Add calls have fired).
+//  4. Wait for all analysis goroutines to complete.
+func (a *application) Wait() {
+	a.streamWg.Wait()
+	a.closeOnce.Do(func() { close(a.events) })
+	<-a.loopDone
+	a.wg.Wait()
+}
+
+// isActionable returns true for events that should trigger agent analysis.
+func isActionable(e stream.Event) bool {
+	return e.Severity == "error" || e.Severity == "fatal"
+}
+
+func (a *application) processAsync(_ stream.Event) {
+	snapshot, id := a.store.Snapshot(recentContextCount)
+	if !a.inflight.tryAcquire(id) {
+		return
 	}
-	a.store.Append(storeEntry)
+	defer a.inflight.release(id)
 
-	// Auto-analyze errors with debouncing
-	if (log.Level == "error" || log.Level == "fatal") && a.debounce.ShouldFire() {
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			a.analyzeAsync(storeEntry)
-		}()
-	}
-
-	return nil
-}
-
-func (a *application) analyzeAsync(errorEntry store.LogEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), analysisTimeout)
 	defer cancel()
 
-	contextLogs := a.store.RecentContext(recentContextCount)
-	analysis, err := a.analyzer.AnalyzeError(ctx, errorEntry, contextLogs)
+	result, err := a.agent.Process(ctx, snapshot)
 	if err != nil {
 		a.logger.Printf("AI analysis failed: %v", err)
 		return
 	}
 
-	a.logger.Printf("=== AI Analysis for [%s] error ===", errorEntry.Source)
-	a.logger.Printf("Error: %s", errorEntry.Message)
-	a.logger.Printf("%s", analysis)
-	a.logger.Printf("=================================")
-
-	a.dispatchPayload(ctx, plugin.AutoAnalysis, analysis, contextLogs)
-}
-
-// Wait blocks until all in-flight background goroutines complete.
-func (a *application) Wait() {
-	a.wg.Wait()
-}
-
-// dispatchPayload sends a payload to all plugins via the dispatcher, if configured.
-func (a *application) dispatchPayload(ctx context.Context, analysisType plugin.AnalysisType, analysis string, logEntries []store.LogEntry) {
-	if a.dispatcher == nil {
-		return
+	if a.output != nil {
+		if err := a.output.Write(stream.AnalysisResult{ID: id, Result: result}); err != nil {
+			a.logger.Printf("output write failed: %v", err)
+		}
 	}
-	a.dispatcher.Send(ctx, plugin.PluginPayload{
-		Type:       analysisType,
-		Analysis:   analysis,
-		LogEntries: logEntries,
-		Timestamp:  time.Now(),
-	})
 }

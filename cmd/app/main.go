@@ -1,7 +1,8 @@
-package app
+package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	nethttp "net/http"
 	"os"
@@ -9,55 +10,79 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tbright/heimdall/api/http"
-	"github.com/tbright/heimdall/internal/app"
-	"github.com/tbright/heimdall/internal/config"
-	"github.com/tbright/heimdall/internal/lifecycle"
-	"github.com/tbright/heimdall/internal/plugin"
-	"github.com/tbright/heimdall/internal/plugin/registry"
-	"github.com/tbright/heimdall/internal/store"
+	"github.com/tab58/heimdall-log-router/api/http"
+	"github.com/tab58/heimdall-log-router/cmd/app/config"
+	"github.com/tab58/heimdall-log-router/internal/app"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
 
 const shutdownTimeout = 10 * time.Second
 
-func main() {
-	// Load config from heimdall.yaml (falls back to defaults + env vars)
-	cfg, err := config.Load("heimdall.yaml")
+var cfg *config.Config
+
+func init() {
+	var err error
+	cfg, err = config.Load()
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		fmt.Printf("failed to load config: %v", err)
+		os.Exit(1)
 	}
+}
 
-	if cfg.APIKey == "" {
-		log.Fatal("ANTHROPIC_API_KEY not configured")
-	}
-
-	// Build plugins from config
-	pluginLogger := log.New(os.Stderr, "[heimdall-plugins] ", log.LstdFlags)
-	plugins := registry.BuildPlugins(cfg.Plugins, pluginLogger)
-	dispatcher := plugin.NewDispatcher(plugins, pluginLogger)
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	appLogger := log.New(os.Stderr, "[heimdall] ", log.LstdFlags)
 
-	// Create application
-	application, err := app.NewApplication(app.ApplicationConfig{
-		Store:        store.New("/tmp/heimdall/data/all.jsonl"),
-		LlmApiKey:    cfg.APIKey,
+	// Results sink: broadcasts agent output to WebSocket subscribers.
+	wsOut := stream.NewWebSocketWriteStream()
+
+	// Create agent and application
+	application := app.NewApplication(app.ApplicationConfig{
 		DebounceTime: cfg.DebounceTime,
-		Dispatcher:   &dispatcher,
 		Logger:       appLogger,
+		Output:       wsOut,
 	})
-	if err != nil {
-		log.Fatalf("failed to create application: %v", err)
+
+	// wire up streams
+
+	// Wire HTTP ingest stream
+	httpStream := stream.NewHTTPIngestStream(256)
+	application.AddStream(httpStream)
+
+	// Wire outbound WebSocket sources (dial upstream log feeds).
+	for _, src := range cfg.Sources.WebSockets {
+		wsSrc := stream.NewWebSocketDialStream(ctx, stream.WebSocketDialConfig{
+			URL:              src.URL,
+			Headers:          src.Headers,
+			BufferSize:       src.BufferSize,
+			HandshakeTimeout: src.HandshakeTimeout,
+			ReconnectMin:     src.ReconnectMin,
+			ReconnectMax:     src.ReconnectMax,
+			PingInterval:     src.PingInterval,
+			Logger: func(format string, args ...any) {
+				appLogger.Printf(format, args...)
+			},
+		})
+		application.AddStream(wsSrc)
+		appLogger.Printf("websocket source %q dialing %s", src.Name, src.URL)
 	}
 
+	// Create HTTP server
 	srv := http.NewServer(http.ServerConfig{
-		Address:     cfg.ServerPort,
-		Application: application,
+		Address:      cfg.ServerPort,
+		Application:  application,
+		IngestStream: httpStream,
+		ResultsSink:  wsOut,
 	})
 
 	// Wait for interrupt signal in a goroutine, start server on main goroutine path
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start the application event loop
+	application.Start(ctx)
 
 	go func() {
 		appLogger.Printf("starting server on %s", srv.Addr)
@@ -68,11 +93,14 @@ func main() {
 
 	<-quit
 
-	// Graceful shutdown: dispatcher first, then server
+	// Graceful shutdown: wait for in-flight work, then dispatcher, then server
 	appLogger.Println("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := lifecycle.GracefulShutdown(ctx, application, &dispatcher, srv); err != nil {
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+	application.Wait()
+	_ = wsOut.Close()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("failed to shutdown: %v", err)
 	}
 }

@@ -6,7 +6,8 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humagin"
 	"github.com/gin-gonic/gin"
-	"github.com/tbright/heimdall/internal/app"
+	heimdallapp "github.com/tab58/heimdall-log-router/internal/app"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
 
 const (
@@ -15,34 +16,39 @@ const (
 	Description = "Heimdall is a service that routes logs to the appropriate destination."
 )
 
+// ServerConfig holds the parameters for NewServer.
 type ServerConfig struct {
-	Address     string
-	Application app.Application
+	Address      string
+	Application  heimdallapp.Application
+	IngestStream *stream.HTTPIngestStream
+	ResultsSink  *stream.WebSocketWriteStream
 }
 
+// NewServer builds an HTTP server with all routes registered.
 func NewServer(cfg ServerConfig) *http.Server {
 	return &http.Server{
 		Addr: cfg.Address,
 		Handler: getRouter(routerConfig{
-			Application: cfg.Application,
+			Application:  cfg.Application,
+			IngestStream: cfg.IngestStream,
+			ResultsSink:  cfg.ResultsSink,
 		}),
 	}
 }
 
 type routerConfig struct {
-	Application app.Application
+	Application  heimdallapp.Application
+	IngestStream *stream.HTTPIngestStream
+	ResultsSink  *stream.WebSocketWriteStream
 }
 
 func getRouter(cfg routerConfig) *gin.Engine {
 	r := gin.New()
-
-	// assign the routes
-	assignRoutes(r, cfg.Application)
-
+	assignRoutes(r, cfg)
 	return r
 }
 
-func assignRoutes(r *gin.Engine, app app.Application) {
+func assignRoutes(r *gin.Engine, cfg routerConfig) {
 	apiServer := humagin.New(r, huma.Config{
 		OpenAPI: &huma.OpenAPI{
 			OpenAPI: "3.1.0",
@@ -65,24 +71,23 @@ func assignRoutes(r *gin.Engine, app app.Application) {
 			Method: "POST",
 			Path:   "/ingest",
 		},
-		Handler: HandleVectorIngest(app),
-	})
-
-	RegisterRoute(RegisterRouteArgs[askRequest, askResponse]{
-		API: apiServer,
-		Operation: huma.Operation{
-			Method: "POST",
-			Path:   "/ask",
-		},
-		Handler: HandleAsk(app),
+		Handler: HandleVectorIngest(cfg.IngestStream),
 	})
 
 	RegisterRoute(RegisterRouteArgs[healthRequest, healthResponse]{
 		API: apiServer,
 		Operation: huma.Operation{
 			Method: "GET",
-			Path:   "/health",
+			Path:   "/healthz",
 		},
 		Handler: HandleHealth(),
 	})
+
+	// WebSocket stream upgrade: GET /stream
+	r.GET("/stream", HandleWebSocketStream(cfg.Application))
+
+	// WebSocket results fan-out: GET /ws/results
+	if cfg.ResultsSink != nil {
+		r.GET("/ws/results", gin.WrapH(cfg.ResultsSink))
+	}
 }

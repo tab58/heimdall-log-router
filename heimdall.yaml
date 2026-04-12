@@ -9,13 +9,10 @@ server_port: ":7077"
 # Debounce interval for auto-analysis of error logs
 debounce_time: 5s
 
-# Directory for plugin error logs
-plugin_log_dir: "/tmp/heimdall/logs/"
-
-# Plugin definitions
-# Each plugin has a name, type, and type-specific config.
-# plugins:
-#   - name: "my-webhook"
-#     type: "webhook"
-#     config:
-#       url: "https://example.com/hook"
+# Upstream WebSocket log sources to dial (optional)
+# sources:
+#   websockets:
+#     - name: "upstream-router"
+#       url: "wss://logs.example.com/stream"
+#       headers:
+#         Authorization: "Bearer ${UPSTREAM_TOKEN}"

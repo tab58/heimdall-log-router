@@ -7,124 +7,106 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tbright/heimdall/internal/plugin"
-	"github.com/tbright/heimdall/internal/store"
+	"github.com/tab58/heimdall-log-router/internal/app/store"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
 
-// TestIntegrationPluginFlow verifies the full flow: ingest error log -> auto-analysis -> plugin receives payload.
-func TestIntegrationPluginFlow(t *testing.T) {
-	// Mock analyzer that returns a predictable analysis.
-	mock := &mockAnalyzer{analyzeResult: "integration test: root cause identified"}
+// TestIntegrationStreamToAgentToOutput verifies the full flow:
+// stream produces an error event → agent processes it → output sink receives the result.
+func TestIntegrationStreamToAgentToOutput(t *testing.T) {
+	mock := &mockAgent{result: "integration test: root cause identified"}
+	out := &mockOutput{}
 
-	// Mock plugin to capture dispatched payloads.
-	mp := &mockPlugin{name: "integration-hook"}
-
-	// Build a real dispatcher with the mock plugin.
 	logger := log.New(&bytes.Buffer{}, "", 0)
-	d := plugin.NewDispatcher([]plugin.Plugin{mp}, logger)
 
-	// Build app with mock analyzer and real dispatcher.
-	s := store.New("")
 	app := &application{
-		store:      s,
-		analyzer:   mock,
-		debounce:   debouncer{cooldown: 0},
-		dispatcher: &d,
-		logger:     logger,
+		agent:    mock,
+		store:    store.New(),
+		debounce: debouncer{cooldown: 0},
+		events:   make(chan stream.Event, 64),
+		logger:   logger,
+		loopDone: make(chan struct{}),
+		output:   out,
 	}
 
-	// Ingest some context logs first.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.Start(ctx)
+
+	// Create a stream and send some context events followed by an error.
+	s := stream.NewHTTPIngestStream(16)
+	app.AddStream(s)
+
 	for i := 0; i < 5; i++ {
-		_ = app.HandleVectorIngest(context.Background(), &VectorIngestLogEntry{
+		s.Write(stream.Event{
 			Timestamp: time.Now(),
-			Source:    "api",
-			Level:     "info",
+			Severity:  "info",
+			Service:   "api",
 			Message:   "normal log entry",
-			Service:   "svc",
 		})
 	}
 
-	// Ingest an error log — should trigger auto-analysis + dispatch.
-	err := app.HandleVectorIngest(context.Background(), &VectorIngestLogEntry{
+	s.Write(stream.Event{
 		Timestamp: time.Now(),
-		Source:    "api",
-		Level:     "error",
+		Severity:  "error",
+		Service:   "api",
 		Message:   "database connection failed",
-		Service:   "svc",
 	})
-	if err != nil {
-		t.Fatalf("HandleVectorIngest error: %v", err)
-	}
+	s.Close()
 
-	// Wait for async analysis.
 	app.Wait()
 
-	// Verify the mock analyzer was called.
-	if got := mock.getAnalyzeCalls(); got != 1 {
-		t.Errorf("analyzeCalls = %d, want 1", got)
+	if got := mock.getProcessCalls(); got != 1 {
+		t.Errorf("processCalls = %d, want 1", got)
 	}
 
-	// Verify the mock plugin received the payload.
-	sends := mp.getSendCalls()
-	if len(sends) != 1 {
-		t.Fatalf("plugin sendCalls = %d, want 1", len(sends))
+	writes := out.getWrites()
+	if len(writes) != 1 {
+		t.Fatalf("output writes = %d, want 1", len(writes))
 	}
-
-	payload := sends[0]
-	if payload.Type != plugin.AutoAnalysis {
-		t.Errorf("payload.Type = %q, want %q", payload.Type, plugin.AutoAnalysis)
+	if writes[0].Result != "integration test: root cause identified" {
+		t.Errorf("result = %q, want %q", writes[0].Result, "integration test: root cause identified")
 	}
-	if payload.Analysis != "integration test: root cause identified" {
-		t.Errorf("payload.Analysis = %q, want %q", payload.Analysis, "integration test: root cause identified")
-	}
-	if len(payload.LogEntries) == 0 {
-		t.Error("payload.LogEntries should not be empty")
+	if writes[0].ID == "" {
+		t.Error("result ID should not be empty")
 	}
 }
 
-// TestIntegrationAskFlow verifies: ask question -> AI response -> plugin receives ask_response payload.
-func TestIntegrationAskFlow(t *testing.T) {
-	mock := &mockAnalyzer{askResult: "the service crashed due to OOM"}
-	mp := &mockPlugin{name: "ask-hook"}
+// TestIntegrationMultipleStreams verifies that multiple concurrent streams all feed
+// into the same event loop.
+func TestIntegrationMultipleStreams(t *testing.T) {
+	mock := &mockAgent{result: "multi-stream analysis"}
 
 	logger := log.New(&bytes.Buffer{}, "", 0)
-	d := plugin.NewDispatcher([]plugin.Plugin{mp}, logger)
-
-	s := store.New("")
-	// Add some logs for context.
-	s.Append(store.LogEntry{
-		Timestamp: time.Now(),
-		Source:    "api",
-		Level:     "error",
-		Message:   "out of memory",
-		Service:   "svc",
-	})
 
 	app := &application{
-		store:      s,
-		analyzer:   mock,
-		debounce:   debouncer{cooldown: 0},
-		dispatcher: &d,
-		logger:     logger,
+		agent:    mock,
+		store:    store.New(),
+		debounce: debouncer{cooldown: 0},
+		events:   make(chan stream.Event, 64),
+		logger:   logger,
+		loopDone: make(chan struct{}),
 	}
 
-	result, err := app.HandleAsk(context.Background(), "why did it crash?", 10)
-	if err != nil {
-		t.Fatalf("HandleAsk error: %v", err)
-	}
-	if result != "the service crashed due to OOM" {
-		t.Errorf("result = %q, want %q", result, "the service crashed due to OOM")
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.Start(ctx)
 
-	// Verify plugin received ask_response payload.
-	sends := mp.getSendCalls()
-	if len(sends) != 1 {
-		t.Fatalf("plugin sendCalls = %d, want 1", len(sends))
-	}
-	if sends[0].Type != plugin.AskResponse {
-		t.Errorf("payload.Type = %q, want %q", sends[0].Type, plugin.AskResponse)
-	}
-	if sends[0].Analysis != "the service crashed due to OOM" {
-		t.Errorf("payload.Analysis = %q, want %q", sends[0].Analysis, "the service crashed due to OOM")
+	// Attach two streams.
+	s1 := stream.NewHTTPIngestStream(8)
+	s2 := stream.NewHTTPIngestStream(8)
+	app.AddStream(s1)
+	app.AddStream(s2)
+
+	// Send an info event from stream 1, an error from stream 2.
+	s1.Write(stream.Event{Timestamp: time.Now(), Severity: "info", Service: "svc1", Message: "ping"})
+	s2.Write(stream.Event{Timestamp: time.Now(), Severity: "error", Service: "svc2", Message: "crash"})
+	s1.Close()
+	s2.Close()
+
+	app.Wait()
+
+	if got := mock.getProcessCalls(); got != 1 {
+		t.Errorf("processCalls = %d, want 1 (one error event)", got)
 	}
 }

@@ -8,254 +8,146 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tbright/heimdall/internal/plugin"
-	"github.com/tbright/heimdall/internal/store"
+	"github.com/tab58/heimdall-log-router/internal/app/store"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
 
-// mockAnalyzer is a test double for the analyzer interface.
-type mockAnalyzer struct {
-	mu            sync.Mutex
-	analyzeResult string
-	analyzeErr    error
-	askResult     string
-	askErr        error
-	analyzeCalls  int
-	askCalls      int
+// mockAgent is a test double for the agent.Agent interface.
+type mockAgent struct {
+	mu           sync.Mutex
+	result       string
+	err          error
+	processCalls int
 }
 
-func (m *mockAnalyzer) AnalyzeError(_ context.Context, _ store.LogEntry, _ []store.LogEntry) (string, error) {
+func (m *mockAgent) Process(_ context.Context, _ []stream.Event) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.analyzeCalls++
-	return m.analyzeResult, m.analyzeErr
+	m.processCalls++
+	return m.result, m.err
 }
 
-func (m *mockAnalyzer) Ask(_ context.Context, _ string, _ []store.LogEntry) (string, error) {
+func (m *mockAgent) getProcessCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.askCalls++
-	return m.askResult, m.askErr
+	return m.processCalls
 }
 
-func (m *mockAnalyzer) getAnalyzeCalls() int {
+// mockOutput captures AnalysisResults written to the application output sink.
+type mockOutput struct {
+	mu      sync.Mutex
+	writes  []stream.AnalysisResult
+	writeFn func(stream.AnalysisResult) error
+}
+
+func (m *mockOutput) Write(r stream.AnalysisResult) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.analyzeCalls
-}
-
-func (m *mockAnalyzer) getAskCalls() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.askCalls
-}
-
-// mockPlugin records Send calls for dispatcher assertions.
-type mockPlugin struct {
-	mu        sync.Mutex
-	name      string
-	sendCalls []plugin.PluginPayload
-}
-
-func (m *mockPlugin) Name() string { return m.name }
-func (m *mockPlugin) Start() error { return nil }
-func (m *mockPlugin) Send(_ context.Context, payload plugin.PluginPayload) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sendCalls = append(m.sendCalls, payload)
+	m.writes = append(m.writes, r)
+	if m.writeFn != nil {
+		return m.writeFn(r)
+	}
 	return nil
 }
-func (m *mockPlugin) Shutdown(_ context.Context) error { return nil }
 
-func (m *mockPlugin) getSendCalls() []plugin.PluginPayload {
+func (m *mockOutput) Close() error { return nil }
+
+func (m *mockOutput) getWrites() []stream.AnalysisResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	copied := make([]plugin.PluginPayload, len(m.sendCalls))
-	copy(copied, m.sendCalls)
+	copied := make([]stream.AnalysisResult, len(m.writes))
+	copy(copied, m.writes)
 	return copied
 }
 
-// newTestApp creates an application with mock analyzer and a dispatcher with the given mock plugins.
-func newTestApp(t *testing.T, mock *mockAnalyzer, plugins ...plugin.Plugin) (*application, []*mockPlugin) {
+// newTestApp builds an application with a mock agent and optional output sink.
+func newTestApp(t *testing.T, mock *mockAgent, out stream.WriteStream) *application {
 	t.Helper()
 	logger := log.New(&bytes.Buffer{}, "", 0)
-	d := plugin.NewDispatcher(plugins, logger)
 	return &application{
-		store:      store.New(""),
-		analyzer:   mock,
-		debounce:   debouncer{cooldown: 0}, // no cooldown for tests
-		dispatcher: &d,
-		logger:     logger,
-	}, nil
-}
-
-func TestNewApplicationWithDispatcher(t *testing.T) {
-	tests := []struct {
-		name    string
-		cfg     ApplicationConfig
-		wantErr bool
-	}{
-		{
-			// Nil dispatcher should be accepted (backwards compatible).
-			name: "nil dispatcher is valid",
-			cfg: ApplicationConfig{
-				Store:        store.New("/tmp/test.jsonl"),
-				LlmApiKey:    "sk-test",
-				DebounceTime: 5 * time.Second,
-			},
-			wantErr: false,
-		},
-		{
-			// Dispatcher provided should be accepted.
-			name: "with dispatcher",
-			cfg: ApplicationConfig{
-				Store:        store.New("/tmp/test.jsonl"),
-				LlmApiKey:    "sk-test",
-				DebounceTime: 5 * time.Second,
-				Dispatcher:   &plugin.Dispatcher{},
-			},
-			wantErr: false,
-		},
-		{
-			// Missing store should still return error.
-			name: "missing store with dispatcher",
-			cfg: ApplicationConfig{
-				LlmApiKey:  "sk-test",
-				Dispatcher: &plugin.Dispatcher{},
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewApplication(tt.cfg)
-			if tt.wantErr && err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			if !tt.wantErr && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
+		agent:    mock,
+		store:    store.New(),
+		debounce: debouncer{cooldown: 0}, // no cooldown for tests
+		events:   make(chan stream.Event, 64),
+		logger:   logger,
+		loopDone: make(chan struct{}),
+		output:   out,
 	}
 }
 
-// HandleVectorIngest should trigger auto-analysis for error logs and dispatch the result.
-func TestHandleVectorIngestAutoAnalysisDispatch(t *testing.T) {
-	mock := &mockAnalyzer{analyzeResult: "root cause: timeout"}
-	mp := &mockPlugin{name: "test"}
-	app, _ := newTestApp(t, mock, mp)
+// AddStream + Start: error events should trigger agent processing and output write.
+func TestAddStreamStartAutoAnalysis(t *testing.T) {
+	mock := &mockAgent{result: "root cause: timeout"}
+	out := &mockOutput{}
+	app := newTestApp(t, mock, out)
 
-	entry := &VectorIngestLogEntry{
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.Start(ctx)
+
+	s := stream.NewHTTPIngestStream(8)
+	app.AddStream(s)
+
+	s.Write(stream.Event{
 		Timestamp: time.Now(),
-		Source:    "api",
-		Level:     "error",
+		Severity:  "error",
+		Service:   "api",
 		Message:   "connection timeout",
-		Service:   "svc",
-	}
+	})
+	s.Close()
 
-	err := app.HandleVectorIngest(context.Background(), entry)
-	if err != nil {
-		t.Fatalf("HandleVectorIngest error: %v", err)
-	}
-
-	// Wait for async analysis goroutine.
 	app.Wait()
 
-	if got := mock.getAnalyzeCalls(); got != 1 {
-		t.Errorf("analyzeCalls = %d, want 1", got)
+	if got := mock.getProcessCalls(); got != 1 {
+		t.Errorf("processCalls = %d, want 1", got)
 	}
-	sends := mp.getSendCalls()
-	if len(sends) != 1 {
-		t.Fatalf("plugin sendCalls = %d, want 1", len(sends))
+	writes := out.getWrites()
+	if len(writes) != 1 {
+		t.Fatalf("output writes = %d, want 1", len(writes))
 	}
-	if sends[0].Type != plugin.AutoAnalysis {
-		t.Errorf("payload type = %q, want %q", sends[0].Type, plugin.AutoAnalysis)
+	if writes[0].Result != "root cause: timeout" {
+		t.Errorf("result = %q, want %q", writes[0].Result, "root cause: timeout")
 	}
-	if sends[0].Analysis != "root cause: timeout" {
-		t.Errorf("payload analysis = %q, want %q", sends[0].Analysis, "root cause: timeout")
+	if writes[0].ID == "" {
+		t.Error("result ID should not be empty")
 	}
 }
 
-// HandleVectorIngest with info level should NOT trigger auto-analysis.
-func TestHandleVectorIngestInfoLevelNoAnalysis(t *testing.T) {
-	mock := &mockAnalyzer{analyzeResult: "should not happen"}
-	mp := &mockPlugin{name: "test"}
-	app, _ := newTestApp(t, mock, mp)
+// Info-level events should NOT trigger agent processing.
+func TestInfoLevelNoAnalysis(t *testing.T) {
+	mock := &mockAgent{result: "should not happen"}
+	out := &mockOutput{}
+	app := newTestApp(t, mock, out)
 
-	entry := &VectorIngestLogEntry{
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.Start(ctx)
+
+	s := stream.NewHTTPIngestStream(8)
+	app.AddStream(s)
+
+	s.Write(stream.Event{
 		Timestamp: time.Now(),
-		Source:    "api",
-		Level:     "info",
+		Severity:  "info",
+		Service:   "api",
 		Message:   "all good",
-		Service:   "svc",
-	}
+	})
+	s.Close()
 
-	err := app.HandleVectorIngest(context.Background(), entry)
-	if err != nil {
-		t.Fatalf("HandleVectorIngest error: %v", err)
-	}
-
-	// No async goroutine expected for info level, but Wait() to be safe.
 	app.Wait()
 
-	if got := mock.getAnalyzeCalls(); got != 0 {
-		t.Errorf("analyzeCalls = %d, want 0 for info level", got)
+	if got := mock.getProcessCalls(); got != 0 {
+		t.Errorf("processCalls = %d, want 0 for info level", got)
 	}
-	if got := len(mp.getSendCalls()); got != 0 {
-		t.Errorf("plugin sendCalls = %d, want 0 for info level", got)
+	if got := len(out.getWrites()); got != 0 {
+		t.Errorf("output writes = %d, want 0 for info level", got)
 	}
 }
 
-// HandleAsk should dispatch ask_response payload after AI responds.
-func TestHandleAskDispatch(t *testing.T) {
-	mock := &mockAnalyzer{askResult: "the answer is 42"}
-	mp := &mockPlugin{name: "test"}
-	app, _ := newTestApp(t, mock, mp)
-
-	result, err := app.HandleAsk(context.Background(), "what happened?", 10)
-	if err != nil {
-		t.Fatalf("HandleAsk error: %v", err)
+// NewApplication should use defaults when optional fields are zero.
+func TestNewApplicationDefaults(t *testing.T) {
+	a := NewApplication(ApplicationConfig{})
+	if a == nil {
+		t.Fatal("NewApplication returned nil")
 	}
-	if result != "the answer is 42" {
-		t.Errorf("result = %q, want %q", result, "the answer is 42")
-	}
-
-	sends := mp.getSendCalls()
-	if len(sends) != 1 {
-		t.Fatalf("plugin sendCalls = %d, want 1", len(sends))
-	}
-	if sends[0].Type != plugin.AskResponse {
-		t.Errorf("payload type = %q, want %q", sends[0].Type, plugin.AskResponse)
-	}
-	if sends[0].Analysis != "the answer is 42" {
-		t.Errorf("payload analysis = %q, want %q", sends[0].Analysis, "the answer is 42")
-	}
-}
-
-// HandleVectorIngest with nil dispatcher should still work (no-op dispatch).
-func TestHandleVectorIngestNilDispatcher(t *testing.T) {
-	mock := &mockAnalyzer{analyzeResult: "analysis"}
-	app := &application{
-		store:      store.New(""),
-		analyzer:   mock,
-		debounce:   debouncer{cooldown: 0},
-		dispatcher: nil,
-		logger:     log.New(&bytes.Buffer{}, "", 0),
-	}
-
-	entry := &VectorIngestLogEntry{
-		Timestamp: time.Now(),
-		Source:    "api",
-		Level:     "error",
-		Message:   "boom",
-		Service:   "svc",
-	}
-
-	err := app.HandleVectorIngest(context.Background(), entry)
-	if err != nil {
-		t.Fatalf("HandleVectorIngest with nil dispatcher error: %v", err)
-	}
-
-	app.Wait()
-	// Should not panic with nil dispatcher.
 }

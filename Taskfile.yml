@@ -16,17 +16,11 @@ tasks:
   run-agent:
     desc: Run the agent
     cmds:
-      - go run cmd/agent/main.go
+      - go run cmd/app/main.go
     silent: true
 
   run-vector:
     desc: Run vector
     cmds:
       - vector --config vector.yaml
-    silent: true
-
-  run-cli:
-    desc: Run the CLI
-    cmds:
-      - go run cmd/cli/main.go
     silent: true

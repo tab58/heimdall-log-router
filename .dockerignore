@@ -1,0 +1,10 @@
+.git
+.gitignore
+.claude
+.idea
+.vscode
+*.md
+Taskfile.yml
+coverage.out
+heimdall.yaml
+vector.yaml

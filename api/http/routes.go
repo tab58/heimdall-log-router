@@ -2,11 +2,17 @@ package http
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"time"
 
-	"github.com/tbright/heimdall/internal/app"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	heimdallapp "github.com/tab58/heimdall-log-router/internal/app"
+	"github.com/tab58/heimdall-log-router/internal/stream"
 )
+
+// --- POST /ingest ---
 
 type ingestRequest struct {
 	Body struct {
@@ -25,69 +31,40 @@ type ingestResponse struct {
 	}
 }
 
-func HandleVectorIngest(application app.Application) RouteHandler[ingestRequest, ingestResponse] {
-	return func(ctx context.Context, input *ingestRequest) (*ingestResponse, error) {
-		entry := &app.VectorIngestLogEntry{
+// HandleVectorIngest writes the incoming log entry to the HTTP ingest stream.
+func HandleVectorIngest(ingestStream *stream.HTTPIngestStream) RouteHandler[ingestRequest, ingestResponse] {
+	return func(_ context.Context, input *ingestRequest) (*ingestResponse, error) {
+		e := stream.Event{
 			Timestamp: input.Body.Timestamp,
-			Source:    input.Body.Source,
-			Level:     input.Body.Level,
-			Message:   input.Body.Message,
+			Severity:  input.Body.Level,
 			Service:   input.Body.Service,
+			Message:   input.Body.Message,
 		}
-		err := application.HandleVectorIngest(ctx, entry)
-		if err != nil {
-			return &ingestResponse{
-				Status: 500,
-				Body: struct {
-					ErrorMessage string `json:"error,omitempty"`
-				}{
-					ErrorMessage: err.Error(),
-				},
-			}, nil
-		}
-
+		ingestStream.Write(e)
 		return &ingestResponse{Status: http.StatusAccepted}, nil
 	}
 }
 
-type askRequest struct {
-	Question    string `json:"question"`
-	NumLogLines int    `json:"num_log_lines"` // number of recent log lines to include
+// --- GET /stream (WebSocket) ---
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-type askResponse struct {
-	Status int
-	Body   struct {
-		Analysis     string `json:"analysis"`
-		ErrorMessage string `json:"error,omitempty"`
-	}
-}
-
-func HandleAsk(application app.Application) RouteHandler[askRequest, askResponse] {
-	return func(ctx context.Context, input *askRequest) (*askResponse, error) {
-		analysis, err := application.HandleAsk(ctx, input.Question, input.NumLogLines)
+// HandleWebSocketStream upgrades the connection to WebSocket and registers it as a stream.
+func HandleWebSocketStream(application heimdallapp.Application) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
-			return &askResponse{
-				Status: 500,
-				Body: struct {
-					Analysis     string `json:"analysis"`
-					ErrorMessage string `json:"error,omitempty"`
-				}{
-					ErrorMessage: err.Error(),
-				},
-			}, nil
+			log.Printf("websocket upgrade failed: %v", err)
+			return
 		}
-		return &askResponse{
-			Status: 200,
-			Body: struct {
-				Analysis     string `json:"analysis"`
-				ErrorMessage string `json:"error,omitempty"`
-			}{
-				Analysis: analysis,
-			},
-		}, nil
+		ws := stream.NewWebSocketStream(conn, 256)
+		application.AddStream(ws)
 	}
 }
+
+// --- GET /healthz ---
 
 type healthRequest struct{}
 type healthResponse struct {
@@ -97,8 +74,9 @@ type healthResponse struct {
 	}
 }
 
+// HandleHealth returns a 200 OK with status "ok".
 func HandleHealth() RouteHandler[healthRequest, healthResponse] {
-	return func(ctx context.Context, input *healthRequest) (*healthResponse, error) {
+	return func(_ context.Context, _ *healthRequest) (*healthResponse, error) {
 		return &healthResponse{
 			Body: struct {
 				Status string `json:"status"`

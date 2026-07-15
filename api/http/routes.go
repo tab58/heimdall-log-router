@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,11 +33,15 @@ type ingestResponse struct {
 }
 
 // HandleVectorIngest writes the incoming log entry to the HTTP ingest stream.
+// All severities are accepted so the monitor can show a live feed; only
+// error/fatal events trigger a batch downstream.
 func HandleVectorIngest(ingestStream *stream.HTTPIngestStream) RouteHandler[ingestRequest, ingestResponse] {
 	return func(_ context.Context, input *ingestRequest) (*ingestResponse, error) {
+		level := strings.ToLower(strings.TrimSpace(input.Body.Level))
 		e := stream.Event{
 			Timestamp: input.Body.Timestamp,
-			Severity:  input.Body.Level,
+			Source:    input.Body.Source,
+			Severity:  level,
 			Service:   input.Body.Service,
 			Message:   input.Body.Message,
 		}
@@ -47,9 +52,11 @@ func HandleVectorIngest(ingestStream *stream.HTTPIngestStream) RouteHandler[inge
 
 // --- GET /stream (WebSocket) ---
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+// Zero-value upgrader: gorilla's default CheckOrigin admits requests without
+// an Origin header (the upstream log processes that dial this endpoint) and
+// otherwise requires the Origin host to match the request host — blocking
+// cross-site WebSocket hijacking from pages in an operator's browser.
+var upgrader = websocket.Upgrader{}
 
 // HandleWebSocketStream upgrades the connection to WebSocket and registers it as a stream.
 func HandleWebSocketStream(application heimdallapp.Application) gin.HandlerFunc {

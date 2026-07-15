@@ -41,13 +41,15 @@ sources:
     decoding:
       codec: json
 
-  # Docker container logs (uncomment if using Docker)
-  # docker_logs:
-  #   type: docker_logs
-  #   include_containers:
-  #     - "api-*"
-  #     - "worker-*"
-  #     - "postgres-*"
+  # Docker container logs (stack services from `task env-up`)
+  docker_logs:
+    type: docker_logs
+    include_containers:
+      - megatron-api
+      - shockwave-ingestion-api
+      - shockwave-worker
+      - starscream-document-api
+      - temporal
 
 # ==============================================================================
 # TRANSFORMS — normalize everything into a common shape
@@ -60,6 +62,37 @@ transforms:
     source: |
       .log_source = "api"
       .service = "api"
+
+  # Docker events carry no .level — derive it. Trust structured slog JSON
+  # verbatim; regex-scan only unstructured lines so an info line mentioning
+  # "error" isn't promoted and doesn't falsely trip Claude batching.
+  tag_docker:
+    type: remap
+    inputs: [docker_logs]
+    source: |
+      .log_source = "docker"
+      .service = to_string(.container_name) ?? "unknown"
+      msg = to_string(.message) ?? ""
+      lvl = "info"
+      structured = false
+      parsed, perr = parse_json(msg)
+      if perr == null && is_object(parsed) {
+        # Any valid JSON payload is structured — never regex-scan it, even if
+        # it lacks a level key (e.g. Echo access logs with an "error":"" field).
+        structured = true
+        plvl = downcase(to_string(parsed.level) ?? "")
+        if plvl != "" {
+          lvl = plvl
+        }
+      }
+      if !structured {
+        if match(msg, r'(?i)\bdebug\b')          { lvl = "debug" }
+        if match(msg, r'(?i)\b(warn|warning)\b') { lvl = "warn" }
+        if match(msg, r'(?i)\berror\b')          { lvl = "error" }
+        if match(msg, r'(?i)\bpanic\b')          { lvl = "panic" }
+        if match(msg, r'(?i)\bfatal\b')          { lvl = "fatal" }
+      }
+      .level = lvl
 
   tag_worker:
     type: remap
@@ -89,35 +122,80 @@ transforms:
   # Merge all tagged sources into a single stream
   merged:
     type: remap
-    inputs: [tag_api, tag_worker, tag_stdin, tag_http]
+    inputs: [tag_api, tag_worker, tag_stdin, tag_http, tag_docker]
     source: |
       # Normalize timestamp
       .timestamp = now()
 
-      # Extract log level from message if not already set
+      # Default missing level to info. Do NOT infer level from message text —
+      # Heimdall must only trigger on real ERROR/FATAL level logs, not on
+      # messages that happen to contain the word "error".
       if !exists(.level) {
         .level = "info"
-        if match(string!(.message), r'(?i)\b(error|err)\b') {
-          .level = "error"
-        } else if match(string!(.message), r'(?i)\b(warn|warning)\b') {
-          .level = "warn"
-        } else if match(string!(.message), r'(?i)\b(debug|dbg)\b') {
-          .level = "debug"
-        } else if match(string!(.message), r'(?i)\b(fatal|panic)\b') {
-          .level = "fatal"
-        }
       }
 
       # Normalize level to lowercase
       .level = downcase(string!(.level))
 
-  # Filter stream for errors only — sent to AI agent
-  errors_only:
-    type: filter
+  # Project onto exactly Heimdall's /ingest schema (see
+  # api/http/routes.go:ingestRequest) — the handler rejects unknown fields,
+  # and vector sources attach extras like source_type.
+  reshape:
+    type: remap
     inputs: [merged]
-    condition:
-      type: vrl
-      source: includes(["error", "fatal"], .level)
+    source: |
+      . = {
+        "timestamp": .timestamp,
+        "log_source": .log_source,
+        "service": .service,
+        "level": .level,
+        "message": .message
+      }
+
+# ==============================================================================
+# TESTS — run with: vector test vector.yaml
+# ==============================================================================
+tests:
+  # Regression: JSON access log with "error":"" field but no level key must
+  # stay info — the regex fallback must never scan structured payloads.
+  - name: docker_json_without_level_stays_info
+    inputs:
+      - insert_at: tag_docker
+        type: log
+        log_fields:
+          container_name: temporal-ui
+          message: '{"time":"2026-07-08T00:00:00Z","status":200,"error":"","method":"GET","URI":"/"}'
+    outputs:
+      - extract_from: tag_docker
+        conditions:
+          - type: vrl
+            source: assert_eq!(.level, "info")
+
+  - name: docker_json_with_level_is_trusted
+    inputs:
+      - insert_at: tag_docker
+        type: log
+        log_fields:
+          container_name: megatron-api
+          message: '{"level":"ERROR","msg":"boom"}'
+    outputs:
+      - extract_from: tag_docker
+        conditions:
+          - type: vrl
+            source: assert_eq!(.level, "error")
+
+  - name: docker_unstructured_error_line_promoted
+    inputs:
+      - insert_at: tag_docker
+        type: log
+        log_fields:
+          container_name: temporal
+          message: "ERROR failed to connect to database"
+    outputs:
+      - extract_from: tag_docker
+        conditions:
+          - type: vrl
+            source: assert_eq!(.level, "error")
 
 # ==============================================================================
 # SINKS — where logs go
@@ -138,16 +216,22 @@ sinks:
     encoding:
       codec: json
 
-  # POST errors to your AI agent service for analysis
+  # POST every event to Heimdall — one JSON object per request (not a batch
+  # array) so the single-object /ingest handler can decode the body directly.
+  # All severities are forwarded: the ring buffer captures the full live feed
+  # and error/fatal gating happens downstream in Heimdall's isActionable.
   ai_agent:
     type: http
-    inputs: [errors_only]
+    inputs: [reshape]
     uri: "http://localhost:7077/ingest"
     method: post
     encoding:
       codec: json
+    framing:
+      method: newline_delimited
     batch:
-      max_events: 10
-      timeout_secs: 2
+      max_events: 1
     request:
       retry_max_duration_secs: 10
+      headers:
+        Content-Type: application/json

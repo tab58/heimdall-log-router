@@ -2,7 +2,8 @@
 set -euo pipefail
 
 : "${HEIMDALL_CONFIG_PATH:=/etc/heimdall/heimdall.yaml}"
-VECTOR_CONFIG_OUT="/tmp/heimdall/vector.yaml"
+: "${HEIMDALL_VECTOR_CONFIG_PATH:=/tmp/heimdall/vector.yaml}"
+export HEIMDALL_VECTOR_CONFIG_PATH
 
 if [[ ! -f "${HEIMDALL_CONFIG_PATH}" ]]; then
     echo "heimdall: config not found at ${HEIMDALL_CONFIG_PATH}" >&2
@@ -10,19 +11,37 @@ if [[ ! -f "${HEIMDALL_CONFIG_PATH}" ]]; then
     exit 1
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "heimdall: ANTHROPIC_API_KEY is not set" >&2
+# Analyzer authenticates via the Claude Code CLI (`claude --print`). Options:
+#   - CLAUDE_CODE_OAUTH_TOKEN env var (long-lived subscription token), or
+#   - bind-mounted ~/.claude + ~/.claude.json from the host.
+# No Anthropic API key is required. If none of the above are provided,
+# `claude` itself will fail the first analysis run and heimdall will log
+# the error — we don't hard-fail here so dev can still boot the container.
+
+mkdir -p "$(dirname "${HEIMDALL_VECTOR_CONFIG_PATH}")"
+
+# Heimdall writes the vector config sub-tree to HEIMDALL_VECTOR_CONFIG_PATH
+# during init() if heimdall.yaml contains a `vector:` block. Start heimdall
+# first, wait briefly for the file to appear, then launch vector.
+heimdall &
+HEIMDALL_PID=$!
+
+for _ in $(seq 1 50); do
+    if [[ -f "${HEIMDALL_VECTOR_CONFIG_PATH}" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ ! -f "${HEIMDALL_VECTOR_CONFIG_PATH}" ]]; then
+    echo "heimdall: vector config was not written to ${HEIMDALL_VECTOR_CONFIG_PATH}" >&2
+    echo "heimdall: ensure heimdall.yaml contains a top-level 'vector:' block" >&2
+    kill -TERM "${HEIMDALL_PID}" 2>/dev/null || true
     exit 1
 fi
 
-mkdir -p "$(dirname "${VECTOR_CONFIG_OUT}")"
-heimdall --extract-vector-config "${VECTOR_CONFIG_OUT}"
-
-vector --config "${VECTOR_CONFIG_OUT}" &
+vector --config "${HEIMDALL_VECTOR_CONFIG_PATH}" &
 VECTOR_PID=$!
-
-heimdall &
-HEIMDALL_PID=$!
 
 shutdown() {
     echo "heimdall: received signal, shutting down" >&2

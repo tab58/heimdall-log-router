@@ -45,7 +45,7 @@ func TestRecentContextWindowCapped(t *testing.T) {
 }
 
 func TestRingBufferEviction(t *testing.T) {
-	s := &LogStore{ring: make([]stream.Event, 0, 3), ringSize: 3}
+	s := &LogStore{ring: make([]entry, 0, 3), ringSize: 3}
 
 	s.Append(makeEvent("info", "a"))
 	s.Append(makeEvent("info", "b"))
@@ -83,6 +83,24 @@ func TestSearchCaseInsensitive(t *testing.T) {
 	results := s.Search("timeout", 10)
 	if len(results) != 1 {
 		t.Fatalf("case-insensitive search: got %d results, want 1", len(results))
+	}
+}
+
+func TestSnapshotReturnsSeq(t *testing.T) {
+	s := New()
+	s.Append(makeEvent("info", "a"))
+	s.Append(makeEvent("info", "b"))
+	seqC := s.Append(makeEvent("error", "c"))
+
+	events, id, lastSeq := s.Snapshot(2)
+	if len(events) != 2 {
+		t.Fatalf("snapshot len = %d, want 2", len(events))
+	}
+	if id == "" {
+		t.Error("id empty")
+	}
+	if lastSeq != seqC {
+		t.Errorf("lastSeq = %d, want %d", lastSeq, seqC)
 	}
 }
 

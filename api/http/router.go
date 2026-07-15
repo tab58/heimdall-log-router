@@ -19,9 +19,10 @@ const (
 // ServerConfig holds the parameters for NewServer.
 type ServerConfig struct {
 	Address      string
+	MonitorPath  string
 	Application  heimdallapp.Application
 	IngestStream *stream.HTTPIngestStream
-	ResultsSink  *stream.WebSocketWriteStream
+	Monitor      *stream.MonitorWS
 }
 
 // NewServer builds an HTTP server with all routes registered.
@@ -31,7 +32,8 @@ func NewServer(cfg ServerConfig) *http.Server {
 		Handler: getRouter(routerConfig{
 			Application:  cfg.Application,
 			IngestStream: cfg.IngestStream,
-			ResultsSink:  cfg.ResultsSink,
+			Monitor:      cfg.Monitor,
+			MonitorPath:  cfg.MonitorPath,
 		}),
 	}
 }
@@ -39,7 +41,8 @@ func NewServer(cfg ServerConfig) *http.Server {
 type routerConfig struct {
 	Application  heimdallapp.Application
 	IngestStream *stream.HTTPIngestStream
-	ResultsSink  *stream.WebSocketWriteStream
+	Monitor      *stream.MonitorWS
+	MonitorPath  string
 }
 
 func getRouter(cfg routerConfig) *gin.Engine {
@@ -49,6 +52,17 @@ func getRouter(cfg routerConfig) *gin.Engine {
 }
 
 func assignRoutes(r *gin.Engine, cfg routerConfig) {
+	monitorPath := cfg.MonitorPath
+	if monitorPath == "" {
+		monitorPath = "/ws/monitor"
+	}
+	if monitorPath == "/" {
+		panic(`monitor_path may not be "/" — it collides with the web UI route`)
+	}
+
+	// Embedded web monitor UI (replaces the Bubble Tea TUI client).
+	r.GET("/", HandleIndex(monitorPath))
+
 	apiServer := humagin.New(r, huma.Config{
 		OpenAPI: &huma.OpenAPI{
 			OpenAPI: "3.1.0",
@@ -86,8 +100,9 @@ func assignRoutes(r *gin.Engine, cfg routerConfig) {
 	// WebSocket stream upgrade: GET /stream
 	r.GET("/stream", HandleWebSocketStream(cfg.Application))
 
-	// WebSocket results fan-out: GET /ws/results
-	if cfg.ResultsSink != nil {
-		r.GET("/ws/results", gin.WrapH(cfg.ResultsSink))
+	// Monitor WebSocket (single client; web UI at GET /). ReplayQueue +
+	// Decide are wired on the *stream.MonitorWS before the server starts.
+	if cfg.Monitor != nil {
+		r.GET(monitorPath, gin.WrapH(cfg.Monitor))
 	}
 }

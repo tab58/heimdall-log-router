@@ -156,3 +156,105 @@ func TestValidateIndexesSourceErrors(t *testing.T) {
 		t.Errorf("error = %q, want index [1]", err.Error())
 	}
 }
+
+func TestModelDefaultAndEnvOverride(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.Model != DefaultModel {
+		t.Errorf("Model default = %q, want %q", cfg.Model, DefaultModel)
+	}
+
+	t.Setenv("HEIMDALL_MODEL", "claude-sonnet-5")
+	applyEnvFallbacks(cfg)
+	if cfg.Model != "claude-sonnet-5" {
+		t.Errorf("Model after env = %q, want %q", cfg.Model, "claude-sonnet-5")
+	}
+}
+
+func TestBatchSizeAndQueueMaxDefaults(t *testing.T) {
+	tests := []struct {
+		name          string
+		in            Config
+		wantBatchSize int
+		wantQueueMax  int
+	}{
+		{"zero values get defaults", Config{}, DefaultBatchSize, DefaultQueueMax},
+		{"explicit values kept", Config{BatchSize: 10, QueueMax: 5}, 10, 5},
+		{"negative values get defaults", Config{BatchSize: -1, QueueMax: -1}, DefaultBatchSize, DefaultQueueMax},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.in
+			applyDefaults(&cfg)
+			if cfg.BatchSize != tt.wantBatchSize {
+				t.Errorf("BatchSize = %d, want %d", cfg.BatchSize, tt.wantBatchSize)
+			}
+			if cfg.QueueMax != tt.wantQueueMax {
+				t.Errorf("QueueMax = %d, want %d", cfg.QueueMax, tt.wantQueueMax)
+			}
+		})
+	}
+}
+
+func TestProviderDefaultsAndModelSelection(t *testing.T) {
+	tests := []struct {
+		name         string
+		in           Config
+		wantProvider string
+		wantModel    string
+	}{
+		{"empty defaults to anthropic + haiku", Config{}, ProviderAnthropic, DefaultModel},
+		{"ollama gets glm cloud default model", Config{Provider: "ollama"}, ProviderOllama, DefaultOllamaModel},
+		{"ollama keeps explicit model", Config{Provider: "ollama", Model: "qwen3.5:9b"}, ProviderOllama, "qwen3.5:9b"},
+		{"anthropic keeps explicit model", Config{Provider: "anthropic", Model: "claude-sonnet-5"}, ProviderAnthropic, "claude-sonnet-5"},
+		{"provider is case-insensitive", Config{Provider: "Ollama"}, ProviderOllama, DefaultOllamaModel},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.in
+			applyDefaults(&cfg)
+			if cfg.Provider != tt.wantProvider {
+				t.Errorf("Provider = %q, want %q", cfg.Provider, tt.wantProvider)
+			}
+			if cfg.Model != tt.wantModel {
+				t.Errorf("Model = %q, want %q", cfg.Model, tt.wantModel)
+			}
+		})
+	}
+}
+
+func TestProviderValidation(t *testing.T) {
+	cfg := &Config{Provider: "openai"}
+	applyDefaults(cfg)
+	if err := validate(cfg); err == nil {
+		t.Error("validate: want error for unknown provider, got nil")
+	}
+}
+
+func TestAPIKeyEnvFallbackByProvider(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "anth-key")
+	t.Setenv("OLLAMA_API_KEY", "olla-key")
+
+	anth := &Config{Provider: ProviderAnthropic}
+	applyDefaults(anth)
+	applyEnvFallbacks(anth)
+	if anth.APIKey != "anth-key" {
+		t.Errorf("anthropic APIKey = %q, want anth-key", anth.APIKey)
+	}
+
+	olla := &Config{Provider: ProviderOllama}
+	applyDefaults(olla)
+	applyEnvFallbacks(olla)
+	if olla.APIKey != "olla-key" {
+		t.Errorf("ollama APIKey = %q, want olla-key", olla.APIKey)
+	}
+
+	explicit := &Config{Provider: ProviderOllama, APIKey: "from-yaml"}
+	applyDefaults(explicit)
+	applyEnvFallbacks(explicit)
+	if explicit.APIKey != "from-yaml" {
+		t.Errorf("explicit APIKey = %q, want from-yaml (yaml wins)", explicit.APIKey)
+	}
+}

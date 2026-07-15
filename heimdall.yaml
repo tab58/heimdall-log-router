@@ -1,13 +1,35 @@
 # Heimdall Log Router Configuration
 #
-# api_key: Anthropic API key (falls back to ANTHROPIC_API_KEY env var)
+# api_key: LLM API key for the selected provider (falls back to
+# ANTHROPIC_API_KEY or OLLAMA_API_KEY env var, matching `provider`)
 # api_key: "sk-your-key-here"
+
+# LLM backend: "anthropic" or "ollama" (Ollama Cloud). `model` is
+# interpreted by this provider; omit it for the provider default
+# (anthropic → claude-haiku-4-5, ollama → glm-5.2:cloud).
+provider: ollama
+model: glm-5.2:cloud
 
 # HTTP server listen address
 server_port: ":7077"
 
-# Debounce interval for auto-analysis of error logs
-debounce_time: 5s
+# Quiet window after the first error before the last batch_size ring events
+# are snapshotted into a queued batch. More errors within the window extend it.
+batch_debounce: 5s
+
+# Number of most-recent log events copied into each batch.
+batch_size: 50
+
+# Max undecided batches held in the processing queue; new batches are
+# rejected while full.
+queue_max: 20
+
+# Folders the analyzer should search for source code, listed in the system
+# prompt. Paths as the analyzer sees them: relative to HEIMDALL_WORKSPACE_DIR
+# (or the process cwd when unset), or absolute. (optional)
+# code_search_dirs:
+#   - services/megatron-api
+#   - environment/shared/golang
 
 # Upstream WebSocket log sources to dial (optional)
 # sources:

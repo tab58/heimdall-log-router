@@ -13,16 +13,49 @@ import (
 )
 
 const (
-	DefaultServerPort   = ":7077"
-	DefaultDebounceTime = 5 * time.Second
+	DefaultServerPort    = ":7077"
+	DefaultBatchDebounce = 3 * time.Second
+	DefaultMonitorPath   = "/ws/monitor"
+	DefaultBatchSize     = 50
+	DefaultQueueMax      = 20
+
+	// Providers selectable via the `provider` key.
+	ProviderAnthropic = "anthropic"
+	ProviderOllama    = "ollama"
+
+	// Per-provider default models, applied when `model` is empty.
+	DefaultModel       = "claude-haiku-4-5"
+	DefaultOllamaModel = "glm-5.2:cloud"
 )
 
 // Config holds all application configuration loaded from heimdall.yaml.
 type Config struct {
-	APIKey       string        `yaml:"api_key"`
-	ServerPort   string        `yaml:"server_port"`
-	DebounceTime time.Duration `yaml:"debounce_time"`
-	Sources      SourcesConfig `yaml:"sources"`
+	APIKey string `yaml:"api_key"`
+	// Provider selects the LLM backend: "anthropic" (default) or "ollama"
+	// (Ollama Cloud unless the model runs locally). Case-insensitive.
+	Provider string `yaml:"provider"`
+	// Model is the model id used for analysis, interpreted by the selected
+	// provider (env HEIMDALL_MODEL overrides). Defaults per provider:
+	// anthropic → claude-haiku-4-5, ollama → glm-5.2:cloud.
+	Model      string `yaml:"model"`
+	ServerPort string `yaml:"server_port"`
+	// BatchDebounce is the quiet window after an error before the log
+	// ring is snapshotted into a batch. Additional errors within the
+	// window extend the wait.
+	BatchDebounce time.Duration `yaml:"batch_debounce"`
+	// BatchSize is the number of most-recent ring-buffer events copied into
+	// each batch when the debounce window fires.
+	BatchSize int `yaml:"batch_size"`
+	// QueueMax caps the number of undecided batches held in the processing
+	// queue. When full, new batches are rejected until space frees up.
+	QueueMax int `yaml:"queue_max"`
+	// CodeSearchDirs lists folders (as seen by the analyzer, i.e. relative to
+	// HEIMDALL_WORKSPACE_DIR or absolute) rendered into the system prompt so
+	// the harness knows where to search for source code.
+	CodeSearchDirs []string `yaml:"code_search_dirs"`
+	// MonitorPath is the WebSocket path the monitor TUI dials.
+	MonitorPath string        `yaml:"monitor_path"`
+	Sources     SourcesConfig `yaml:"sources"`
 	// Vector holds an embedded Vector config tree. Written to disk at startup
 	// so the Vector process can be launched against it.
 	Vector yaml.Node `yaml:"vector"`
@@ -91,7 +124,7 @@ func Load() (*Config, error) {
 		configPath = "heimdall.yaml"
 	}
 
-	var cfg *Config
+	cfg := &Config{}
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -103,7 +136,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
@@ -123,8 +156,28 @@ func applyDefaults(cfg *Config) {
 	if cfg.ServerPort == "" {
 		cfg.ServerPort = DefaultServerPort
 	}
-	if cfg.DebounceTime == 0 {
-		cfg.DebounceTime = DefaultDebounceTime
+	if cfg.BatchDebounce == 0 {
+		cfg.BatchDebounce = DefaultBatchDebounce
+	}
+	if cfg.MonitorPath == "" {
+		cfg.MonitorPath = DefaultMonitorPath
+	}
+	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	if cfg.Provider == "" {
+		cfg.Provider = ProviderAnthropic
+	}
+	if cfg.Model == "" {
+		if cfg.Provider == ProviderOllama {
+			cfg.Model = DefaultOllamaModel
+		} else {
+			cfg.Model = DefaultModel
+		}
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = DefaultBatchSize
+	}
+	if cfg.QueueMax <= 0 {
+		cfg.QueueMax = DefaultQueueMax
 	}
 	cfg.Sources.WebSockets = applyWebSocketDefaults(cfg.Sources.WebSockets)
 }
@@ -169,6 +222,10 @@ func validate(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
+	// Empty means applyDefaults hasn't run (or will pick anthropic).
+	if cfg.Provider != "" && cfg.Provider != ProviderAnthropic && cfg.Provider != ProviderOllama {
+		return fmt.Errorf("provider must be %q or %q, got %q", ProviderAnthropic, ProviderOllama, cfg.Provider)
+	}
 	for i, s := range cfg.Sources.WebSockets {
 		if err := validateWebSocketSource(s); err != nil {
 			return fmt.Errorf("sources.websockets[%d]: %w", i, err)
@@ -201,13 +258,21 @@ func validateWebSocketSource(s WebSocketSource) error {
 }
 
 // applyEnvFallbacks fills in config values from environment variables.
-// ANTHROPIC_API_KEY is a fallback (yaml wins). HEIMDALL_SERVER_PORT is an
-// override (env wins) so the container can set the port without editing yaml.
+// The provider's API key env var (ANTHROPIC_API_KEY / OLLAMA_API_KEY) is a
+// fallback (yaml wins). PORT is an override (env wins) so the container can
+// set the port without editing yaml.
 func applyEnvFallbacks(cfg *Config) {
 	if cfg.APIKey == "" {
-		cfg.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+		if cfg.Provider == ProviderOllama {
+			cfg.APIKey = os.Getenv("OLLAMA_API_KEY")
+		} else {
+			cfg.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
 	}
-	if port := os.Getenv("HEIMDALL_SERVER_PORT"); port != "" {
+	if model := os.Getenv("HEIMDALL_MODEL"); model != "" {
+		cfg.Model = model
+	}
+	if port := os.Getenv("PORT"); port != "" {
 		if !strings.HasPrefix(port, ":") {
 			port = ":" + port
 		}

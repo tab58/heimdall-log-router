@@ -22,5 +22,8 @@ tasks:
   run-vector:
     desc: Run vector
     cmds:
+      # vector fails at startup if data_dir doesn't exist; sinks/sources
+      # under /tmp/heimdall need their dirs too.
+      - mkdir -p /tmp/heimdall/vector-data /tmp/heimdall/data /tmp/heimdall/logs/api /tmp/heimdall/logs/worker
       - vector --config vector.yaml
     silent: true

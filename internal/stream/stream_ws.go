@@ -2,6 +2,7 @@ package stream
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -51,6 +52,7 @@ func readEventsInto(conn *websocket.Conn, ch chan<- Event) error {
 		if err := json.Unmarshal(msg, &e); err != nil {
 			continue
 		}
+		e.Severity = strings.ToLower(strings.TrimSpace(e.Severity))
 		ch <- e
 	}
 }
